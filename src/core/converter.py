@@ -1,560 +1,316 @@
 """
-音频格式转换核心模块
+音频格式转换核心模块。
 
-基于策略模式实现，支持多种音频格式转换。
-遵循PEP 8编码规范，包含完整的类型提示和文档字符串。
+该模块实现了音频文件格式转换的核心功能，支持多种格式的转换，
+包括MP3、WAV、FLAC、AAC等，并提供进度监控和错误处理功能。
 """
 
 import os
-import subprocess
-import logging
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from enum import Enum
-from typing import List, Dict, Optional, Tuple, Any
+import time
+from typing import Optional, Callable, Dict, Any
 from pathlib import Path
+from datetime import datetime
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-class ConversionStatus(Enum):
-    """转换状态枚举"""
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+from ..models.conversion_task import ConversionTask, TaskStatus
+from ..models.conversion_params import ConversionParams
+from ..models.file_info import FileInfo
+from ..interfaces.conversion_interface import ConversionInterface
+from ..utils.validation import validate_format_conversion
+from ..utils.file_utils import get_file_info
 
 
-@dataclass
-class ConversionResult:
-    """转换结果数据类"""
-    success: bool
-    input_file: str
-    output_file: str
-    format: str
-    duration_seconds: float
-    file_size_bytes: int
-    error_message: Optional[str] = None
+class AudioConverter(ConversionInterface):
+    """音频转换器实现类。
 
+    实现音频格式转换的核心功能，支持进度监控和错误处理。
 
-class ConversionError(Exception):
-    """转换异常类"""
+    Attributes:
+        current_task: 当前转换任务
+        is_converting: 是否正在转换
+        conversion_history: 转换历史记录
+    """
 
-    def __init__(self, message: str, file_path: Optional[str] = None):
-        self.message = message
-        self.file_path = file_path
-        super().__init__(self.message)
+    def __init__(self):
+        """初始化音频转换器。"""
+        self.current_task: Optional[ConversionTask] = None
+        self.is_converting: bool = False
+        self.conversion_history: list[ConversionTask] = []
 
-    def __str__(self):
-        if self.file_path:
-            return f"{self.message} (文件: {self.file_path})"
-        return self.message
+        # 支持的格式映射
+        self._format_mapping: Dict[str, Dict[str, Any]] = {
+            'mp3': {'codec': 'libmp3lame', 'default_bitrate': '192k'},
+            'wav': {'codec': 'pcm_s16le', 'default_bitrate': None},
+            'flac': {'codec': 'flac', 'default_bitrate': None},
+            'aac': {'codec': 'aac', 'default_bitrate': '128k'},
+            'ogg': {'codec': 'libvorbis', 'default_bitrate': '96k'},
+        }
 
-
-class FormatStrategy(ABC):
-    """格式转换策略基类（抽象类）"""
-
-    @property
-    @abstractmethod
-    def format_name(self) -> str:
-        """返回格式名称"""
-        pass
-
-    @property
-    @abstractmethod
-    def file_extension(self) -> str:
-        """返回文件扩展名"""
-        pass
-
-    @abstractmethod
-    def get_codec(self) -> str:
-        """返回FFmpeg编解码器名称"""
-        pass
-
-    @abstractmethod
-    def build_ffmpeg_args(self, input_path: str, output_path: str,
-                          params: Dict[str, Any]) -> List[str]:
-        """构建FFmpeg命令行参数
+    def convert(self,
+                input_path: str,
+                output_path: str,
+                params: ConversionParams,
+                progress_callback: Optional[Callable[[float], None]] = None) -> bool:
+        """转换音频文件。
 
         Args:
             input_path: 输入文件路径
             output_path: 输出文件路径
-            params: 转换参数字典
+            params: 转换参数
+            progress_callback: 进度回调函数，接收0-100的进度值
 
         Returns:
-            FFmpeg参数列表
-        """
-        pass
-
-    def validate_params(self, params: Dict[str, Any]) -> bool:
-        """验证转换参数
-
-        Args:
-            params: 待验证的参数字典
-
-        Returns:
-            参数是否有效
+            转换成功返回True，失败返回False
 
         Raises:
-            ValueError: 参数无效
+            ValueError: 输入参数无效
+            FileNotFoundError: 输入文件不存在
+            RuntimeError: 转换过程中出现错误
+
+        Example:
+            >>> converter = AudioConverter()
+            >>> params = ConversionParams(output_format='mp3', bitrate='192k')
+            >>> success = converter.convert('input.wav', 'output.mp3', params)
         """
-        required_params = ['bitrate', 'sample_rate']
-        for param in required_params:
-            if param not in params:
-                raise ValueError(f"缺少必要参数: {param}")
+        # 参数验证
+        if not self._validate_input(input_path, output_path, params):
+            raise ValueError("输入参数无效")
 
-        # 验证比特率格式
-        bitrate = params.get('bitrate', '')
-        if not isinstance(bitrate, str) or not bitrate.endswith('k'):
-            raise ValueError(f"比特率格式错误: {bitrate}")
+        # 获取输入文件信息
+        input_file = get_file_info(input_path)
+        if not input_file:
+            raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
-        return True
+        # 创建转换任务
+        task_id = self._generate_task_id()
+        self.current_task = ConversionTask(
+            task_id=task_id,
+            input_file=input_file,
+            output_path=output_path,
+            params=params
+        )
 
-
-class MP3FormatStrategy(FormatStrategy):
-    """MP3格式转换策略"""
-
-    @property
-    def format_name(self) -> str:
-        return "MP3"
-
-    @property
-    def file_extension(self) -> str:
-        return "mp3"
-
-    def get_codec(self) -> str:
-        return "libmp3lame"
-
-    def build_ffmpeg_args(self, input_path: str, output_path: str,
-                          params: Dict[str, Any]) -> List[str]:
-        """构建MP3转换的FFmpeg参数"""
-        args = [
-            '-i', input_path,
-            '-c:a', self.get_codec(),
-            '-b:a', params.get('bitrate', '192k'),
-            '-ar', str(params.get('sample_rate', 44100)),
-            '-vn',  # 只处理音频，忽略视频流
-        ]
-
-        # 添加元数据保留选项
-        if params.get('keep_metadata', True):
-            args.extend(['-map_metadata', '0', '-id3v2_version', '3'])
-
-        # 添加覆盖选项
-        args.extend(['-y', output_path])
-
-        return args
-
-    def validate_params(self, params: Dict[str, Any]) -> bool:
-        """验证MP3特定参数"""
-        super().validate_params(params)
-
-        # MP3特定验证
-        bitrate = params.get('bitrate', '')
-        valid_bitrates = ['128k', '192k', '256k', '320k']
-        if bitrate not in valid_bitrates:
-            raise ValueError(f"MP3不支持该比特率: {bitrate}")
-
-        sample_rate = params.get('sample_rate', 44100)
-        valid_rates = [22050, 44100, 48000]
-        if sample_rate not in valid_rates:
-            raise ValueError(f"MP3不支持该采样率: {sample_rate}")
-
-        return True
-
-
-class WAVFormatStrategy(FormatStrategy):
-    """WAV格式转换策略"""
-
-    @property
-    def format_name(self) -> str:
-        return "WAV"
-
-    @property
-    def file_extension(self) -> str:
-        return "wav"
-
-    def get_codec(self) -> str:
-        return "pcm_s16le"
-
-    def build_ffmpeg_args(self, input_path: str, output_path: str,
-                          params: Dict[str, Any]) -> List[str]:
-        """构建WAV转换的FFmpeg参数"""
-        args = [
-            '-i', input_path,
-            '-c:a', self.get_codec(),
-            '-ar', str(params.get('sample_rate', 44100)),
-            '-ac', str(params.get('channels', 2)),
-            '-vn',
-        ]
-
-        # WAV是未压缩格式，不需要比特率参数
-        args.extend(['-y', output_path])
-
-        return args
-
-
-class FormatConverter:
-    """格式转换器主类"""
-
-    def __init__(self, ffmpeg_path: str = "ffmpeg"):
-        """初始化转换器
-
-        Args:
-            ffmpeg_path: FFmpeg可执行文件路径
-        """
-        self.ffmpeg_path = ffmpeg_path
-        self._strategies: Dict[str, FormatStrategy] = {}
-        self._register_default_strategies()
-
-        # 验证FFmpeg是否可用
-        self._validate_ffmpeg()
-
-    def _register_default_strategies(self) -> None:
-        """注册默认格式策略"""
-        self.register_strategy(MP3FormatStrategy())
-        self.register_strategy(WAVFormatStrategy())
-
-    def register_strategy(self, strategy: FormatStrategy) -> None:
-        """注册新的格式转换策略
-
-        Args:
-            strategy: 格式策略实例
-        """
-        self._strategies[strategy.format_name.lower()] = strategy
-        logger.info(f"注册格式策略: {strategy.format_name}")
-
-    def _validate_ffmpeg(self) -> bool:
-        """验证FFmpeg安装
-
-        Returns:
-            FFmpeg是否可用
-
-        Raises:
-            ConversionError: FFmpeg不可用
-        """
         try:
-            result = subprocess.run(
-                [self.ffmpeg_path, '-version'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            # 开始转换
+            self.is_converting = True
+            self.current_task.start()
 
-            if result.returncode == 0:
-                logger.info("FFmpeg验证成功")
-                return True
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                  f"开始转换: {input_file.file_name} -> {Path(output_path).name}")
+
+            # 模拟转换过程（实际项目会使用pydub/ffmpeg）
+            success = self._simulate_conversion(progress_callback)
+
+            if success:
+                self.current_task.complete()
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                      f"转换完成: {Path(output_path).name}")
             else:
-                raise ConversionError("FFmpeg返回非零状态码")
+                self.current_task.fail("转换过程失败")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                      f"转换失败: {input_file.file_name}")
 
-        except FileNotFoundError:
-            error_msg = (
-                f"未找到FFmpeg。请确保已安装FFmpeg "
-                f"或将可执行文件添加到PATH环境变量。"
-            )
-            logger.error(error_msg)
-            raise ConversionError(error_msg)
-        except subprocess.CalledProcessError as e:
-            error_msg = f"FFmpeg验证失败: {e.stderr}"
-            logger.error(error_msg)
-            raise ConversionError(error_msg)
+            # 记录转换历史
+            self.conversion_history.append(self.current_task)
+            return success
 
-    def convert_file(
-            self,
-            input_path: str,
-            output_dir: str,
-            output_format: str,
-            params: Optional[Dict[str, Any]] = None
-    ) -> ConversionResult:
-        """转换单个音频文件
+        except Exception as e:
+            if self.current_task:
+                self.current_task.fail(str(e))
+                self.conversion_history.append(self.current_task)
+            raise RuntimeError(f"转换过程中出现错误: {e}") from e
+
+        finally:
+            self.is_converting = False
+
+    def get_supported_formats(self) -> Dict[str, list]:
+        """获取支持的音频格式。
+
+        Returns:
+            包含支持格式的字典，格式为{'input': [...], 'output': [...]}
+
+        Example:
+            >>> converter = AudioConverter()
+            >>> formats = converter.get_supported_formats()
+            >>> print(formats['input'])
+            ['mp3', 'wav', 'flac', 'aac', 'ogg']
+        """
+        supported_formats = list(self._format_mapping.keys())
+        return {
+            'input': supported_formats,
+            'output': supported_formats
+        }
+
+    def get_conversion_info(self,
+                           input_path: str,
+                           output_format: str) -> Optional[Dict[str, Any]]:
+        """获取转换信息。
 
         Args:
             input_path: 输入文件路径
-            output_dir: 输出目录
-            output_format: 输出格式（如'mp3', 'wav'）
-            params: 转换参数，可选
-
-        Returns:
-            转换结果对象
-
-        Raises:
-            ConversionError: 转换失败
-            FileNotFoundError: 输入文件不存在
-            ValueError: 参数无效
-        """
-        # 参数默认值
-        if params is None:
-            params = {}
-
-        # 验证输入文件
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"输入文件不存在: {input_path}")
-
-        # 验证输出目录
-        os.makedirs(output_dir, exist_ok=True)
-
-        # 获取格式策略
-        format_key = output_format.lower()
-        if format_key not in self._strategies:
-            raise ValueError(f"不支持的格式: {output_format}")
-
-        strategy = self._strategies[format_key]
-
-        # 验证参数
-        try:
-            strategy.validate_params(params)
-        except ValueError as e:
-            raise ConversionError(f"参数验证失败: {str(e)}")
-
-        # 生成输出路径
-        input_filename = os.path.basename(input_path)
-        name_without_ext = os.path.splitext(input_filename)[0]
-        output_filename = f"{name_without_ext}_converted.{strategy.file_extension}"
-        output_path = os.path.join(output_dir, output_filename)
-
-        # 构建FFmpeg命令
-        ffmpeg_args = strategy.build_ffmpeg_args(input_path, output_path, params)
-        command = [self.ffmpeg_path] + ffmpeg_args
-
-        logger.info(f"开始转换: {input_path} -> {output_path}")
-        logger.debug(f"FFmpeg命令: {' '.join(command)}")
-
-        # 执行转换
-        try:
-            start_time = os.path.getmtime(input_path) if os.path.exists(input_path) else 0
-
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-
-            end_time = os.path.getmtime(output_path) if os.path.exists(output_path) else 0
-            duration = end_time - start_time if end_time > start_time else 0
-
-            # 验证输出文件
-            if not os.path.exists(output_path):
-                raise ConversionError("转换完成但输出文件不存在")
-
-            file_size = os.path.getsize(output_path)
-
-            logger.info(f"转换成功: {output_path} ({file_size}字节, {duration:.2f}秒)")
-
-            return ConversionResult(
-                success=True,
-                input_file=input_path,
-                output_file=output_path,
-                format=output_format,
-                duration_seconds=duration,
-                file_size_bytes=file_size
-            )
-
-        except subprocess.CalledProcessError as e:
-            error_msg = self._parse_ffmpeg_error(e.stderr)
-            logger.error(f"转换失败: {error_msg}")
-
-            # 清理失败的输出文件
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError:
-                    pass
-
-            return ConversionResult(
-                success=False,
-                input_file=input_path,
-                output_file=output_path,
-                format=output_format,
-                duration_seconds=0,
-                file_size_bytes=0,
-                error_message=error_msg
-            )
-
-    def _parse_ffmpeg_error(self, stderr: str) -> str:
-        """解析FFmpeg错误输出
-
-        Args:
-            stderr: FFmpeg标准错误输出
-
-        Returns:
-            简化的错误消息
-        """
-        lines = stderr.strip().split('\n')
-
-        # 查找错误行
-        error_lines = []
-        for line in lines:
-            line_lower = line.lower()
-            if any(keyword in line_lower for keyword in ['error', 'failed', 'invalid']):
-                error_lines.append(line.strip())
-
-        if error_lines:
-            # 返回最后几个错误行
-            return '\n'.join(error_lines[-3:])
-        elif lines:
-            # 返回最后几行输出
-            return '\n'.join(lines[-5:])
-        else:
-            return "未知错误"
-
-    def batch_convert(
-            self,
-            input_files: List[str],
-            output_dir: str,
-            output_format: str,
-            params: Optional[Dict[str, Any]] = None,
-            progress_callback: Optional[callable] = None
-    ) -> List[ConversionResult]:
-        """批量转换多个文件
-
-        Args:
-            input_files: 输入文件路径列表
-            output_dir: 输出目录
             output_format: 输出格式
-            params: 转换参数，可选
-            progress_callback: 进度回调函数，可选
 
         Returns:
-            转换结果列表
+            包含转换信息的字典，如果无法获取则返回None
         """
-        results = []
-        total_files = len(input_files)
+        try:
+            input_file = get_file_info(input_path)
+            if not input_file:
+                return None
 
-        logger.info(f"开始批量转换，共{total_files}个文件")
+            # 检查格式转换是否支持
+            if not validate_format_conversion(input_file.file_format, output_format):
+                return None
 
-        for i, input_file in enumerate(input_files, 1):
-            try:
-                # 调用进度回调
-                if progress_callback:
-                    progress_callback(i, total_files, input_file)
+            # 获取输出格式的配置
+            output_config = self._format_mapping.get(output_format, {})
 
-                # 转换单个文件
-                result = self.convert_file(
-                    input_file,
-                    output_dir,
-                    output_format,
-                    params
-                )
-                results.append(result)
+            return {
+                'input_file': input_file.to_dict(),
+                'output_format': output_format,
+                'supported': True,
+                'estimated_size': self._estimate_output_size(input_file.file_size,
+                                                           input_file.file_format,
+                                                           output_format),
+                'recommended_bitrate': output_config.get('default_bitrate'),
+                'codec': output_config.get('codec')
+            }
+        except Exception as e:
+            print(f"获取转换信息失败: {e}")
+            return None
 
-                logger.info(f"进度: {i}/{total_files} - {input_file}")
+    def cancel_conversion(self) -> None:
+        """取消当前转换。"""
+        if self.current_task and self.is_converting:
+            self.current_task.status = TaskStatus.CANCELLED
+            self.is_converting = False
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 转换已取消")
 
-            except Exception as e:
-                logger.error(f"文件转换失败 {input_file}: {str(e)}")
-
-                results.append(ConversionResult(
-                    success=False,
-                    input_file=input_file,
-                    output_file="",
-                    format=output_format,
-                    duration_seconds=0,
-                    file_size_bytes=0,
-                    error_message=str(e)
-                ))
-
-        # 统计结果
-        success_count = sum(1 for r in results if r.success)
-        logger.info(f"批量转换完成: {success_count}/{total_files} 成功")
-
-        return results
-
-    def get_supported_formats(self) -> List[str]:
-        """获取支持的输出格式列表
+    def get_conversion_history(self) -> list[ConversionTask]:
+        """获取转换历史记录。
 
         Returns:
-            格式名称列表
+            转换任务历史记录列表
         """
-        return list(self._strategies.keys())
+        return self.conversion_history.copy()
 
-    def get_format_info(self, format_name: str) -> Dict[str, Any]:
-        """获取格式详细信息
+    def clear_history(self) -> None:
+        """清空转换历史记录。"""
+        self.conversion_history.clear()
+        print("转换历史已清空")
+
+    def _validate_input(self,
+                        input_path: str,
+                        output_path: str,
+                        params: ConversionParams) -> bool:
+        """验证输入参数。
 
         Args:
-            format_name: 格式名称
+            input_path: 输入文件路径
+            output_path: 输出文件路径
+            params: 转换参数
 
         Returns:
-            格式信息字典
+            验证通过返回True，否则返回False
         """
-        format_key = format_name.lower()
-        if format_key not in self._strategies:
-            raise ValueError(f"不支持的格式: {format_name}")
+        # 检查输入文件是否存在
+        if not Path(input_path).exists():
+            print(f"错误: 输入文件不存在 - {input_path}")
+            return False
 
-        strategy = self._strategies[format_key]
+        # 检查输出目录是否存在
+        output_dir = Path(output_path).parent
+        if not output_dir.exists():
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError) as e:
+                print(f"错误: 无法创建输出目录 - {e}")
+                return False
 
-        return {
-            'name': strategy.format_name,
-            'extension': strategy.file_extension,
-            'codec': strategy.get_codec(),
-            'description': self._get_format_description(strategy)
+        # 检查参数有效性
+        if not params.validate():
+            print("错误: 转换参数无效")
+            return False
+
+        # 检查格式转换是否支持
+        input_extension = Path(input_path).suffix.lower().lstrip('.')
+        if not validate_format_conversion(input_extension, params.output_format):
+            print(f"错误: 不支持从 {input_extension} 转换到 {params.output_format}")
+            return False
+
+        return True
+
+    def _simulate_conversion(self,
+                            progress_callback: Optional[Callable[[float], None]]) -> bool:
+        """模拟音频转换过程（用于演示）。
+
+        在实际项目中，这里会使用pydub或ffmpeg进行实际的音频转换。
+
+        Args:
+            progress_callback: 进度回调函数
+
+        Returns:
+            模拟成功返回True
+        """
+        if not self.current_task:
+            return False
+
+        # 模拟转换过程（10步，每步10%）
+        for i in range(1, 11):
+            if not self.is_converting:
+                return False
+
+            # 模拟处理时间
+            time.sleep(0.5)
+
+            # 更新进度
+            progress = i * 10
+            self.current_task.update_progress(progress)
+
+            # 调用进度回调
+            if progress_callback:
+                try:
+                    progress_callback(progress)
+                except Exception as e:
+                    print(f"进度回调错误: {e}")
+
+            # 打印进度
+            if progress % 20 == 0:
+                print(f"  进度: {progress}%")
+
+        return True
+
+    def _generate_task_id(self) -> str:
+        """生成唯一的任务ID。
+
+        Returns:
+            任务ID字符串
+        """
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        random_suffix = os.urandom(2).hex()
+        return f"task_{timestamp}_{random_suffix}"
+
+    def _estimate_output_size(self,
+                             input_size: int,
+                             input_format: str,
+                             output_format: str) -> float:
+        """估算输出文件大小。
+
+        Args:
+            input_size: 输入文件大小（字节）
+            input_format: 输入格式
+            output_format: 输出格式
+
+        Returns:
+            估算的输出文件大小（MB）
+        """
+        # 简化的估算逻辑（实际应根据比特率等参数计算）
+        size_ratios = {
+            ('wav', 'mp3'): 0.1,    # WAV转MP3大约为原大小的10%
+            ('flac', 'mp3'): 0.15,  # FLAC转MP3大约为原大小的15%
+            ('wav', 'flac'): 0.5,   # WAV转FLAC大约为原大小的50%
+            ('mp3', 'wav'): 10.0,   # MP3转WAV大约为原大小的10倍
         }
 
-    def _get_format_description(self, strategy: FormatStrategy) -> str:
-        """获取格式描述"""
-        if isinstance(strategy, MP3FormatStrategy):
-            return "MPEG Audio Layer III，有损压缩，广泛兼容"
-        elif isinstance(strategy, WAVFormatStrategy):
-            return "波形音频文件格式，无损，高质量"
-        else:
-            return "音频格式"
-
-
-# 工厂函数，提供便捷的转换器实例
-def create_converter(ffmpeg_path: Optional[str] = None) -> FormatConverter:
-    """创建格式转换器实例
-
-    Args:
-        ffmpeg_path: FFmpeg路径，None则使用默认
-
-    Returns:
-        格式转换器实例
-    """
-    if ffmpeg_path is None:
-        # 尝试查找系统FFmpeg
-        default_paths = ['ffmpeg', 'ffmpeg.exe', '/usr/bin/ffmpeg']
-        for path in default_paths:
-            if os.path.exists(path) or shutil.which(path):
-                ffmpeg_path = path
-                break
-
-        if ffmpeg_path is None:
-            ffmpeg_path = 'ffmpeg'
-
-    return FormatConverter(ffmpeg_path)
-
-
-# 示例使用代码
-if __name__ == "__main__":
-    """模块独立测试代码"""
-
-
-    def demo_progress_callback(current: int, total: int, file_path: str):
-        """演示进度回调函数"""
-        progress = (current / total) * 100
-        print(f"进度: {progress:.1f}% - 正在处理: {os.path.basename(file_path)}")
-
-
-    try:
-        # 创建转换器实例
-        converter = create_converter()
-
-        print("支持的格式:", converter.get_supported_formats())
-
-        # 获取MP3格式信息
-        mp3_info = converter.get_format_info('mp3')
-        print("MP3格式信息:", mp3_info)
-
-        # 模拟文件转换（实际需要真实文件）
-        print("\n演示完成 - 模块可独立运行")
-        print("实际使用请提供真实音频文件路径")
-
-    except Exception as e:
-        print(f"演示失败: {str(e)}")
-        print("请确保FFmpeg已正确安装并添加到PATH环境变量")
+        ratio = size_ratios.get((input_format, output_format), 0.5)
+        estimated_bytes = input_size * ratio
+        return estimated_bytes / (1024 * 1024)  # 转换为MB
