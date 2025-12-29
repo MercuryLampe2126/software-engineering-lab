@@ -8,30 +8,24 @@ env/
 venv/
 .env
 .venv
+env.bak/
+venv.bak/
 
-# 开发工具
-.idea/
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
 
-# 测试相关
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-
-# 输出文件
-output/
-*.mp3
-*.wav
-*.flac
-*.log
-
-# 系统文件
+# OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# 项目特定
-config/local_settings.yaml
-*.db
+# Audio files (temporary)
+temp_audio/
+*.temp.*
